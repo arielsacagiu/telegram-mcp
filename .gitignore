@@ -201,3 +201,8 @@ sticker.webp
 two.png
 aliases.json
 incoming_feed.jsonl
+
+# Telegram Desktop instance data (tdata holds the account auth keys — never commit)
+tg-accounts/
+*/tdata/
+tdata/

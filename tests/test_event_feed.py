@@ -18,6 +18,7 @@ def _mono(seconds_ago=0.0):
 
 def _pending_record(last_ts, count=2, name="Client"):
     return {
+        "account": "default",
         "first_ts": last_ts - 1.0,
         "last_ts": last_ts,
         "count": count,
@@ -45,13 +46,13 @@ def _clean_state(monkeypatch, tmp_path):
 
 def test_scan_settled_picks_quiet_chat():
     now = time.monotonic()
-    events._pending_msgs[1] = _pending_record(now - 10)
-    events._pending_msgs[2] = _pending_record(now)
+    events._pending_msgs[("default", 1)] = _pending_record(now - 10)
+    events._pending_msgs[("default", 2)] = _pending_record(now)
 
     settled, soonest = events._scan_settled(now, settle=6.0)
-    assert settled == 1
+    assert settled == ("default", 1)
 
-    del events._pending_msgs[1]
+    del events._pending_msgs[("default", 1)]
     settled, soonest = events._scan_settled(now, settle=6.0)
     assert settled is None
     assert 0 < soonest <= 6.0
@@ -65,7 +66,7 @@ def test_burst_summary_sanitizes_name():
 
 @pytest.mark.asyncio
 async def test_feed_writes_settled_burst_and_consumes_it():
-    events._pending_msgs[42] = _pending_record(_mono(1.0))
+    events._pending_msgs[("default", 42)] = _pending_record(_mono(1.0))
     events._start_feed(settle_ms=100)
 
     for _ in range(50):
@@ -84,11 +85,11 @@ async def test_feed_writes_settled_burst_and_consumes_it():
 
 @pytest.mark.asyncio
 async def test_feed_debounces_until_quiet():
-    events._pending_msgs[42] = _pending_record(_mono())  # just active
+    events._pending_msgs[("default", 42)] = _pending_record(_mono())  # just active
     events._start_feed(settle_ms=300)
 
     await asyncio.sleep(0.1)
-    assert 42 in events._pending_msgs  # not settled yet
+    assert ("default", 42) in events._pending_msgs  # not settled yet
 
     for _ in range(50):
         await asyncio.sleep(0.02)
@@ -127,7 +128,7 @@ async def test_autostart_via_env(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_wait_for_settled_message_still_works():
-    events._pending_msgs[7] = _pending_record(_mono(10))
+    events._pending_msgs[("default", 7)] = _pending_record(_mono(10))
     result = json.loads(await events.wait_for_settled_message(settle_ms=100, max_wait_ms=1000))
     assert result["event"] is True
     assert result["chat_id"] == 7
@@ -137,14 +138,17 @@ async def test_wait_for_settled_message_still_works():
 @pytest.mark.asyncio
 async def test_enable_with_unwritable_path_starts_nothing(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_EVENT_FEED_FILE", str(tmp_path / "missing" / "feed.jsonl"))
-    events._pending_msgs[42] = _pending_record(_mono(1.0))
+    events._pending_msgs[("default", 42)] = _pending_record(_mono(1.0))
 
     out = await events.enable_incoming_feed(settle_ms=100)
 
     assert not out.startswith("{")  # error string, not a status blob
     assert events.feed_enabled() is False  # no orphan consumer
     await asyncio.sleep(0.3)
-    assert 42 in events._pending_msgs  # burst still available to wait_for_settled_message
+    assert (
+        "default",
+        42,
+    ) in events._pending_msgs  # burst still available to wait_for_settled_message
 
 
 @pytest.mark.asyncio
@@ -166,13 +170,13 @@ async def test_autostart_stays_off_without_env():
 
 @pytest.mark.asyncio
 async def test_write_failure_retains_burst(monkeypatch, tmp_path):
-    events._pending_msgs[42] = _pending_record(_mono(1.0))
+    events._pending_msgs[("default", 42)] = _pending_record(_mono(1.0))
     events._start_feed(settle_ms=100)
     # Break the path after the task has started.
     monkeypatch.setenv("TELEGRAM_EVENT_FEED_FILE", str(tmp_path / "missing" / "feed.jsonl"))
 
     await asyncio.sleep(0.3)
-    assert 42 in events._pending_msgs  # not silently destroyed
+    assert ("default", 42) in events._pending_msgs  # not silently destroyed
 
 
 def test_default_feed_path_is_runtime_state_not_install_dir(monkeypatch, tmp_path):
@@ -215,7 +219,7 @@ async def test_rotated_world_readable_file_is_tightened_on_write():
     path = events.feed_file_path()
     path.touch()
     os.chmod(path, 0o644)
-    events._pending_msgs[42] = _pending_record(_mono(1.0))
+    events._pending_msgs[("default", 42)] = _pending_record(_mono(1.0))
     events._start_feed(settle_ms=50)
 
     for _ in range(50):
@@ -251,10 +255,10 @@ async def test_on_new_incoming_records_and_autostarts(monkeypatch):
         message=SimpleNamespace(id=7),
         get_sender=get_sender,
     )
-    await events._on_new_incoming(event)
+    await events._on_new_incoming(event, "default")
 
-    assert 42 in events._pending_msgs
-    assert events._pending_msgs[42]["count"] == 1
+    assert ("default", 42) in events._pending_msgs
+    assert events._pending_msgs[("default", 42)]["count"] == 1
     assert events.feed_enabled()  # env autostart ran from the handler
 
 
@@ -263,7 +267,7 @@ async def test_wait_for_chat_ignores_other_chats(monkeypatch):
     # The bug this fixes: an agent waiting for one person was woken by every
     # unrelated conversation, burned the turn, and fell back to sleep-polling.
     monkeypatch.setattr(events, "_wait_target", _target(42))
-    events._pending_msgs[999] = _pending_record(_mono(10))  # noise from someone else
+    events._pending_msgs[("default", 999)] = _pending_record(_mono(10))  # noise from someone else
 
     result = json.loads(
         await events.wait_for_settled_message(settle_ms=50, max_wait_ms=200, chat_id=42)
@@ -271,39 +275,39 @@ async def test_wait_for_chat_ignores_other_chats(monkeypatch):
 
     assert result["event"] is False  # the other chat did not wake it
     assert result["waiting_for"] == 42
-    assert 999 in events._pending_msgs  # and its burst is still there for later
+    assert ("default", 999) in events._pending_msgs  # and its burst is still there for later
 
 
 @pytest.mark.asyncio
 async def test_wait_for_chat_returns_when_that_chat_speaks(monkeypatch):
     monkeypatch.setattr(events, "_wait_target", _target(42))
-    events._pending_msgs[999] = _pending_record(_mono(10))
-    events._pending_msgs[42] = _pending_record(_mono(10))
+    events._pending_msgs[("default", 999)] = _pending_record(_mono(10))
+    events._pending_msgs[("default", 42)] = _pending_record(_mono(10))
 
     result = json.loads(
         await events.wait_for_settled_message(settle_ms=50, max_wait_ms=500, chat_id=42)
     )
 
     assert result["event"] is True and result["chat_id"] == 42
-    assert 999 in events._pending_msgs  # unrelated burst untouched
+    assert ("default", 999) in events._pending_msgs  # unrelated burst untouched
 
 
 @pytest.mark.asyncio
 async def test_wait_for_new_message_filters_by_chat(monkeypatch):
     monkeypatch.setattr(events, "_wait_target", _target(42))
-    events._pending_msgs[999] = _pending_record(_mono(1))
+    events._pending_msgs[("default", 999)] = _pending_record(_mono(1))
 
     timed_out = json.loads(await events.wait_for_new_message(timeout=0.2, chat_id=42))
     assert timed_out["event"] is False
 
-    events._pending_msgs[42] = _pending_record(_mono(1))
+    events._pending_msgs[("default", 42)] = _pending_record(_mono(1))
     hit = json.loads(await events.wait_for_new_message(timeout=0.2, chat_id=42))
     assert [c["chat_id"] for c in hit["pending_chats"]] == [42]
 
 
 @pytest.mark.asyncio
 async def test_unfiltered_wait_still_sees_every_chat():
-    events._pending_msgs[999] = _pending_record(_mono(10))
+    events._pending_msgs[("default", 999)] = _pending_record(_mono(10))
 
     result = json.loads(await events.wait_for_settled_message(settle_ms=50, max_wait_ms=500))
 

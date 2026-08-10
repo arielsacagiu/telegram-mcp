@@ -21,8 +21,12 @@ from telethon import utils
 
 from telegram_mcp.runtime import *  # mcp, clients, ToolAnnotations, log_and_format_error
 
-# chat_id -> {first_ts, last_ts, count, first_id, last_id, name, username}
-_pending_msgs: Dict[int, Dict[str, Any]] = {}
+# (account, chat_id) -> {account, first_ts, last_ts, count, first_id, last_id, name, username}
+#
+# Keyed by account as well as chat, because every configured client feeds this
+# same map: two accounts can legitimately see the same chat_id, and merging them
+# would both miscount bursts and let one account's watcher consume another's.
+_pending_msgs: Dict[Tuple[str, int], Dict[str, Any]] = {}
 _activity_event: Optional[asyncio.Event] = None
 
 # --- Incoming event feed (callback mode) ---
@@ -36,6 +40,34 @@ _feed_settle_ms: int = 6000
 _feed_autostart_done: bool = False
 
 
+def _resolve_account_filter(account: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize an ``account`` argument into ``(label, error)``.
+
+    ``None`` means "watch every account" and yields ``(None, None)``. An unknown
+    label yields an error string naming the configured accounts, matching how
+    ``get_client`` reports the same mistake — reached before ``_wait_target``,
+    so a typo does not surface as an opaque error code from get_client.
+    """
+    if account is None:
+        return None, None
+    label = account.strip().lower()
+    if label not in clients:
+        available = ", ".join(clients.keys())
+        return None, f"Error: unknown account '{account}'. Available accounts: {available}"
+    return label, None
+
+
+def _pending_for(
+    account: Optional[str] = None, chat_id: Optional[int] = None
+) -> list[Tuple[Tuple[str, int], Dict[str, Any]]]:
+    """Pending (key, record) pairs, optionally narrowed to one account and/or chat."""
+    return [
+        (key, rec)
+        for key, rec in list(_pending_msgs.items())
+        if (account is None or key[0] == account) and (chat_id is None or key[1] == chat_id)
+    ]
+
+
 def _get_activity_event() -> asyncio.Event:
     """Lazily create the asyncio.Event on the running loop."""
     global _activity_event
@@ -45,22 +77,23 @@ def _get_activity_event() -> asyncio.Event:
 
 
 def _scan_settled(
-    now: float, settle: float, only: Optional[int] = None
-) -> Tuple[Optional[int], Optional[float]]:
+    now: float, settle: float, only: Optional[int] = None, account: Optional[str] = None
+) -> Tuple[Optional[Tuple[str, int]], Optional[float]]:
     """Find a chat whose burst has been quiet for `settle` seconds.
 
-    Returns (settled_chat_id, seconds_until_soonest_chat_settles). The second
-    value is None when nothing is pending; the first is None when no chat has
-    settled yet. With `only` set, every other chat is ignored — waiting for one
-    person must not be interrupted by unrelated conversations.
+    Returns (settled_key, seconds_until_soonest_chat_settles), where the key is
+    the ``(account, chat_id)`` pair. The second value is None when nothing is
+    pending; the first is None when no chat has settled yet. With `only` set,
+    every other chat is ignored — waiting for one person must not be interrupted
+    by unrelated conversations. With `account` set, other accounts are ignored
+    the same way, so a watcher scoped to one account cannot consume another's
+    burst.
     """
     soonest_remaining = None
-    for cid, rec in list(_pending_msgs.items()):
-        if only is not None and cid != only:
-            continue
+    for key, rec in _pending_for(account, only):
         quiet = now - rec["last_ts"]
         if quiet >= settle:
-            return cid, None
+            return key, None
         rem = settle - quiet
         if soonest_remaining is None or rem < soonest_remaining:
             soonest_remaining = rem
@@ -82,6 +115,7 @@ def _burst_summary(chat_id: int, rec: Dict[str, Any]) -> Dict[str, Any]:
     """Settled-burst record shared by wait_for_settled_message and the feed."""
     return {
         "event": True,
+        "account": rec["account"],
         "chat_id": chat_id,
         "name": sanitize_name(rec["name"]),
         "username": rec["username"],
@@ -144,10 +178,10 @@ async def _feed_loop(settle_ms: int) -> None:
     ev = _get_activity_event()
     while True:
         try:
-            settled_cid, soonest_remaining = _scan_settled(time.monotonic(), settle)
-            if settled_cid is not None:
-                rec = _pending_msgs[settled_cid]
-                line = dict(_burst_summary(settled_cid, rec), ts=round(time.time(), 2))
+            settled_key, soonest_remaining = _scan_settled(time.monotonic(), settle)
+            if settled_key is not None:
+                rec = _pending_msgs[settled_key]
+                line = dict(_burst_summary(settled_key[1], rec), ts=round(time.time(), 2))
                 del line["event"]
                 # ponytail: append-only file; rotate it manually (tail -F survives rotation)
                 with _open_feed_append() as f:
@@ -155,7 +189,7 @@ async def _feed_loop(settle_ms: int) -> None:
                 # Pop only after a successful write (no await in between, so no
                 # consumer can observe the burst twice); a write failure retries
                 # the same burst on the next iteration instead of dropping it.
-                _pending_msgs.pop(settled_cid, None)
+                _pending_msgs.pop(settled_key, None)
                 continue
             if soonest_remaining is not None:
                 await asyncio.sleep(soonest_remaining)
@@ -196,8 +230,12 @@ def _maybe_autostart_feed() -> None:
         _start_feed(_feed_settle_ms)
 
 
-async def _on_new_incoming(event) -> None:
-    """Record incoming private (non-bot, non-self) messages for the debounce tools."""
+async def _on_new_incoming(event, account: str) -> None:
+    """Record incoming private (non-bot, non-self) messages for the debounce tools.
+
+    ``account`` is the label of the client that received the event, bound at
+    registration time by :func:`register_incoming_handlers`.
+    """
     try:
         if not event.is_private:
             return
@@ -209,9 +247,10 @@ async def _on_new_incoming(event) -> None:
         chat_id = event.chat_id
         now = time.monotonic()
         msg_id = event.message.id
-        rec = _pending_msgs.get(chat_id)
+        rec = _pending_msgs.get((account, chat_id))
         if rec is None:
-            _pending_msgs[chat_id] = {
+            _pending_msgs[(account, chat_id)] = {
+                "account": account,
                 "first_ts": now,
                 "last_ts": now,
                 "count": 1,
@@ -239,10 +278,20 @@ def register_incoming_handlers() -> None:
     Safe to call before clients connect — Telethon registers the handler and
     delivers events once connected. Called at import time so the package's
     `import telegram_mcp.tools` registration also wires up the listener.
+
+    Each client gets its own closure so the receiving account's label travels
+    with the event; Telethon itself passes only the event to the callback.
     """
-    for cl in clients.values():
+
+    def _handler_for(account: str):
+        async def _handler(event):
+            await _on_new_incoming(event, account)
+
+        return _handler
+
+    for label, cl in clients.items():
         try:
-            cl.add_event_handler(_on_new_incoming, _events.NewMessage(incoming=True))
+            cl.add_event_handler(_handler_for(label), _events.NewMessage(incoming=True))
         except Exception:
             logging.getLogger("telegram_mcp").exception("failed to register incoming handler")
 
@@ -276,25 +325,37 @@ async def wait_for_new_message(
             any unrelated conversation wakes the call and you burn turns on
             messages you are not waiting for. Other chats keep accumulating and
             are still there when you ask for them.
+        account: Watch only this account, and resolve `chat_id` against it. Omit
+            to watch every configured account. When set, messages arriving on
+            other accounts neither wake this call nor appear in the result — each
+            pending chat still carries an "account" field naming the account that
+            received it, which you pass to follow-up tools (list_messages,
+            send_message, mark_as_read, ...) so the reply goes out from there.
     """
     try:
+        account_filter, filter_error = _resolve_account_filter(account)
+        if filter_error:
+            return filter_error
+
         target = await _wait_target(chat_id, account)
         ev = _get_activity_event()
         deadline = time.monotonic() + timeout
         while True:
-            pending = {
-                cid: rec for cid, rec in _pending_msgs.items() if target is None or cid == target
-            }
+            # Clear before inspecting: a message arriving during the scan then
+            # re-sets the event, so the wait below returns instead of missing it.
+            ev.clear()
+            pending = _pending_for(account_filter, target)
             if pending:
                 chats = [
                     {
-                        "chat_id": cid,
+                        "account": rec["account"],
+                        "chat_id": key[1],
                         "name": sanitize_name(rec["name"]),
                         "username": rec["username"],
                         "count": rec["count"],
                         "last_message_id": rec["last_id"],
                     }
-                    for cid, rec in pending.items()
+                    for key, rec in pending
                 ]
                 return json.dumps({"event": True, "pending_chats": chats}, ensure_ascii=False)
 
@@ -350,18 +411,31 @@ async def wait_for_settled_message(
             other conversation wakes the call, wastes a turn, and tempts you into
             sleep-polling. Bursts from other chats stay pending and are returned by
             later unfiltered calls.
+        account: Watch only this account, and resolve `chat_id` against it. Omit
+            to watch every configured account. Because this tool CONSUMES what it
+            returns, scoping it matters: without `account`, a loop minding one
+            account drains and discards the other accounts' bursts. Bursts on
+            other accounts stay pending for their own watcher. The result carries
+            an "account" field — pass it to follow-up tools so the reply goes out
+            from the account the messages arrived on.
     """
     try:
+        account_filter, filter_error = _resolve_account_filter(account)
+        if filter_error:
+            return filter_error
+
         target = await _wait_target(chat_id, account)
         settle = settle_ms / 1000.0
         deadline = time.monotonic() + max_wait_ms / 1000.0
         ev = _get_activity_event()
         while True:
             now = time.monotonic()
-            settled_cid, soonest_remaining = _scan_settled(now, settle, only=target)
-            if settled_cid is not None:
-                rec = _pending_msgs.pop(settled_cid)
-                return json.dumps(_burst_summary(settled_cid, rec), ensure_ascii=False)
+            settled_key, soonest_remaining = _scan_settled(
+                now, settle, only=target, account=account_filter
+            )
+            if settled_key is not None:
+                rec = _pending_msgs.pop(settled_key)
+                return json.dumps(_burst_summary(settled_key[1], rec), ensure_ascii=False)
             remaining_total = deadline - now
             if remaining_total <= 0:
                 return json.dumps(

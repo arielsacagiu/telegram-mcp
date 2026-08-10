@@ -160,6 +160,89 @@ def test_discover_accounts_exits_when_no_sessions_configured(monkeypatch):
         runtime._discover_accounts()
 
 
+def _valid_session_string() -> str:
+    """A genuinely decodable StringSession, so the happy path is not mocked."""
+    from telethon.crypto import AuthKey
+    from telethon.sessions import StringSession
+
+    session = StringSession()
+    session.set_dc(2, "149.154.167.51", 443)
+    session.auth_key = AuthKey(bytes(256))
+    return session.save()
+
+
+def test_valid_session_string_is_still_accepted(monkeypatch):
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING_WORK", _valid_session_string())
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    accounts = runtime._discover_accounts()
+
+    assert sorted(accounts) == ["work"]
+    assert accounts["work"].args[0].server_address == "149.154.167.51"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "not-a-session-string",  # fails the version-character check
+        "1short",  # right prefix, wrong length -> struct.error
+        "1" + "!" * 352,  # right length, undecodable base64 -> binascii.Error
+    ],
+)
+def test_invalid_suffixed_session_string_names_the_variable(monkeypatch, bad_value):
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING_WORK", bad_value)
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._discover_accounts()
+
+    message = str(excinfo.value)
+    assert "TELEGRAM_SESSION_STRING_WORK" in message
+    assert "session_string_generator" in message
+
+
+def test_invalid_unsuffixed_session_string_names_the_variable(monkeypatch):
+    _clear_session_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSION_STRING", "not-a-session-string")
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._discover_accounts()
+
+    assert "TELEGRAM_SESSION_STRING" in str(excinfo.value)
+
+
+def test_invalid_pooled_session_string_names_the_pool_and_position(monkeypatch):
+    """With several pooled sessions, say WHICH entry is malformed."""
+    _clear_session_env(monkeypatch)
+    monkeypatch.delenv("TELEGRAM_SESSION_STRINGS", raising=False)
+    monkeypatch.setenv("TELEGRAM_SESSION_STRINGS", "not-a-session-string")
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._discover_accounts()
+
+    message = str(excinfo.value)
+    assert "TELEGRAM_SESSION_STRINGS" in message
+    assert "entry 1" in message
+
+
+def test_every_pooled_session_is_validated_not_only_the_claimed_one(monkeypatch):
+    """A pool slot is claimed per process, so a bad entry would otherwise only
+    break whichever client happens to claim it — an intermittent failure."""
+    _clear_session_env(monkeypatch)
+    monkeypatch.delenv("TELEGRAM_SESSION_STRINGS", raising=False)
+    monkeypatch.setenv("TELEGRAM_SESSION_STRINGS", f"{_valid_session_string()} truncated-second")
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._discover_accounts()
+
+    assert "entry 2" in str(excinfo.value)
+
+
 def _clear_proxy_env(monkeypatch):
     for key in list(runtime.os.environ):
         if key.startswith("TELEGRAM_PROXY_"):

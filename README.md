@@ -354,6 +354,22 @@ set them to keep a stable, recognisable device name. The same variables are
 read both by the session string generator (at login) and by the server (on
 every connect), so set them in the same place as your other credentials.
 
+Each variable also accepts an `_<LABEL>` suffix, which overrides the
+unsuffixed default for that account. Without it every configured account
+reports the same device, so they are indistinguishable in the active-sessions
+list — which is where you go to spot and revoke a session you did not expect:
+
+```env
+TELEGRAM_DEVICE_MODEL=Telegram MCP
+TELEGRAM_DEVICE_MODEL_WORK=Telegram MCP (work)
+TELEGRAM_DEVICE_MODEL_PERSONAL=Telegram MCP (personal)
+```
+
+Here `work` uses its own name, `personal` uses its own, and any other account
+falls back to `Telegram MCP`. The session string generator has no account
+label, so it always uses the unsuffixed values; the per-account name takes
+effect once the server connects.
+
 ## Proxy Support
 
 Route Telegram traffic through a proxy by setting the `TELEGRAM_PROXY_*`

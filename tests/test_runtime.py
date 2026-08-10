@@ -166,6 +166,20 @@ def _clear_proxy_env(monkeypatch):
             monkeypatch.delenv(key, raising=False)
 
 
+def test_build_client_applies_the_accounts_own_device_identity(monkeypatch):
+    """Each account should appear separately in Telegram's active-sessions list."""
+    monkeypatch.delenv("TELEGRAM_DEVICE_MODEL", raising=False)
+    monkeypatch.setenv("TELEGRAM_DEVICE_MODEL_WORK", "work laptop")
+    monkeypatch.setenv("TELEGRAM_DEVICE_MODEL_PERSONAL", "personal phone")
+    monkeypatch.setattr(runtime, "TelegramClient", _FakeTelegramClient)
+
+    work = runtime._build_client("work.session", "work")
+    personal = runtime._build_client("personal.session", "personal")
+
+    assert work.kwargs["device_model"] == "work laptop"
+    assert personal.kwargs["device_model"] == "personal phone"
+
+
 def test_build_proxy_returns_none_when_unset(monkeypatch):
     _clear_proxy_env(monkeypatch)
     assert runtime._build_proxy_for_label("default") == (None, None)

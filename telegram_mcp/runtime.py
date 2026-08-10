@@ -409,6 +409,25 @@ def _acquire_session(pool: List[str]) -> str:
     )
 
 
+def _string_session(value: str, source: str) -> StringSession:
+    """Build a ``StringSession``, naming the variable when the value is bad.
+
+    Telethon raises a bare ``ValueError``/``struct.error``/``binascii.Error``
+    from deep inside the decoder, which surfaces as an unattributed traceback
+    from an ``import``. With several accounts configured, that does not say
+    which of them is malformed.
+    """
+    try:
+        return StringSession(value)
+    except Exception as exc:
+        raise SystemExit(
+            f"{source} is not a valid Telegram session string ({type(exc).__name__}: {exc}). "
+            "Generate one with `uv run session_string_generator.py` and copy the whole "
+            "value, including the leading '1'. To use a session file instead, set "
+            "TELEGRAM_SESSION_NAME."
+        ) from None
+
+
 def _discover_accounts() -> dict[str, TelegramClient]:
     """Scan env vars to build account label -> TelegramClient mapping.
 
@@ -431,7 +450,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
     for key, value in os.environ.items():
         if key.startswith(prefix_str) and value:
             label = key[len(prefix_str) :].lower()
-            accounts[label] = _build_client(StringSession(value), label)
+            accounts[label] = _build_client(_string_session(value, key), label)
         elif key.startswith(prefix_name) and value:
             label = key[len(prefix_name) :].lower()
             accounts[label] = _build_client(value, label)
@@ -444,11 +463,21 @@ def _discover_accounts() -> dict[str, TelegramClient]:
 
     if "default" not in accounts:
         if session_pool:
-            accounts["default"] = _build_client(
-                StringSession(_acquire_session(session_pool)), "default"
-            )
+            # Validate every entry, not just the claimed one: a slot is claimed
+            # per process, so a malformed entry would otherwise break only
+            # whichever client happens to claim it, and only once enough clients
+            # are running to reach it. Name the position, since the pool is one
+            # variable holding many values.
+            sessions = [
+                _string_session(entry, f"TELEGRAM_SESSION_STRINGS entry {index + 1}")
+                for index, entry in enumerate(session_pool)
+            ]
+            claimed = session_pool.index(_acquire_session(session_pool))
+            accounts["default"] = _build_client(sessions[claimed], "default")
         elif session_string:
-            accounts["default"] = _build_client(StringSession(session_string), "default")
+            accounts["default"] = _build_client(
+                _string_session(session_string, "TELEGRAM_SESSION_STRING"), "default"
+            )
         elif session_name:
             accounts["default"] = _build_client(session_name, "default")
 

@@ -183,6 +183,10 @@ _EXPOSED_TOOLS_ALLOW_SEPARATOR = "+"
 def _split_exposed_tools_mode(mode: str) -> tuple[str, list[str]]:
     """Split a normalised exposure mode into its base mode and write allowlist."""
     base, separator, raw_allowlist = mode.partition(_EXPOSED_TOOLS_ALLOW_SEPARATOR)
+    # Strip the base too, not just the names: "read-only + send_message" would
+    # otherwise leave a trailing space on the base and be rejected as an
+    # unknown mode, while "read-only+ send_message" worked.
+    base = base.strip()
     if not separator:
         return base, []
     return base, [name.strip() for name in raw_allowlist.split(",") if name.strip()]

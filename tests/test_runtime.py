@@ -123,6 +123,19 @@ def test_apply_exposed_tools_allowlist_rejects_unknown_tool():
     assert _tool_names(server) == {"read_tool", "write_tool", "send_tool"}
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "read-only + send_tool",  # space before the separator
+        "read-only +send_tool",
+        "read-only\t+send_tool",
+    ],
+)
+def test_get_exposed_tools_mode_tolerates_space_around_the_separator(value):
+    """Spacing after '+' was already accepted; spacing before it aborted startup."""
+    assert runtime._get_exposed_tools_mode(value) == "read-only+send_tool"
+
+
 def test_get_exposed_tools_mode_rejects_allowlist_with_all():
     with pytest.raises(SystemExit) as excinfo:
         runtime._get_exposed_tools_mode("all+send_tool")

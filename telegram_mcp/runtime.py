@@ -328,7 +328,7 @@ def _build_client(session: Any, label: str) -> TelegramClient:
         kwargs["proxy"] = proxy
     if connection is not None:
         kwargs["connection"] = connection
-    kwargs.update(client_identity_kwargs())
+    kwargs.update(client_identity_kwargs(label))
     return TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH, **kwargs)
 
 

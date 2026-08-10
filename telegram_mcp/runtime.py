@@ -111,7 +111,31 @@ def get_entity_filter_type(entity: Any) -> Optional[str]:
 
 load_dotenv()
 
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
+
+def _resolve_api_id(value: Optional[str] = None) -> int:
+    """Return the configured Telegram API ID as an int.
+
+    Fails with an actionable message instead of the bare ``TypeError`` that
+    ``int(None)`` raises when the variable is unset, which is the most common
+    first-run misconfiguration.
+    """
+    raw_value = os.getenv("TELEGRAM_API_ID") if value is None else value
+    if raw_value is None or not raw_value.strip():
+        raise SystemExit(
+            "TELEGRAM_API_ID is not set. Create an application at "
+            "https://my.telegram.org/apps and set TELEGRAM_API_ID and "
+            "TELEGRAM_API_HASH in your .env file or environment."
+        )
+    try:
+        return int(raw_value.strip())
+    except ValueError:
+        raise SystemExit(
+            f"TELEGRAM_API_ID must be an integer, got '{raw_value}'. "
+            "Copy the numeric App api_id from https://my.telegram.org/apps."
+        ) from None
+
+
+TELEGRAM_API_ID = _resolve_api_id()
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
 # The shared HTTP service can be consumed by long-lived MCP clients. Stateless requests keep
@@ -720,7 +744,11 @@ def log_and_format_error(
                     break
 
         prefix_str = prefix.value if isinstance(prefix, ErrorCategory) else (prefix or "GEN")
-        error_code = f"{prefix_str}-ERR-{abs(hash(function_name)) % 1000:03d}"
+        # A content digest, not hash(): str hashing is salted per process, so
+        # hash() would give the same function a different code on every restart
+        # and make reported codes ungreppable.
+        digest = hashlib.sha1(function_name.encode("utf-8")).hexdigest()
+        error_code = f"{prefix_str}-ERR-{int(digest[:8], 16) % 1000:03d}"
 
     # Format the additional context parameters
     context = ", ".join(f"{k}={v}" for k, v in kwargs.items())

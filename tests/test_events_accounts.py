@@ -11,9 +11,14 @@ from telegram_mcp.tools import events
 
 @pytest.fixture(autouse=True)
 def _clear_pending():
+    # The activity Event binds to whichever loop first awaits it. Production has
+    # one loop for the process lifetime (asyncio.run), but each async test gets a
+    # fresh one, so drop the cached Event along with the pending map.
     events._pending_msgs.clear()
+    events._activity_event = None
     yield
     events._pending_msgs.clear()
+    events._activity_event = None
 
 
 def _fake_event(chat_id, message_id, name="Alice", username="alice"):
@@ -99,6 +104,101 @@ async def test_settled_messages_drain_per_account_not_per_chat_id():
     assert {first["account"], second["account"]} == {"work", "personal"}
     assert first["chat_id"] == second["chat_id"] == 555
     assert events._pending_msgs == {}
+
+
+@pytest.fixture
+def two_accounts(monkeypatch):
+    """Make 'work' and 'personal' resolvable as configured account labels."""
+    monkeypatch.setattr(events, "clients", {"work": object(), "personal": object()})
+
+
+@pytest.mark.asyncio
+async def test_wait_for_new_message_filters_to_one_account(two_accounts):
+    await events._on_new_incoming(_fake_event(555, 1), "work")
+    await events._on_new_incoming(_fake_event(666, 2), "personal")
+
+    payload = json.loads(await events.wait_for_new_message(timeout=0.05, account="work"))
+
+    assert [chat["chat_id"] for chat in payload["pending_chats"]] == [555]
+    assert payload["pending_chats"][0]["account"] == "work"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_new_message_ignores_traffic_on_other_accounts(two_accounts):
+    """A message on another account must not wake a filtered waiter."""
+    await events._on_new_incoming(_fake_event(555, 1), "work")
+
+    payload = json.loads(await events.wait_for_new_message(timeout=0.05, account="personal"))
+
+    assert payload["event"] is False
+    assert payload["reason"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_settled_message_only_drains_the_named_account(two_accounts):
+    await events._on_new_incoming(_fake_event(555, 1), "work")
+    await events._on_new_incoming(_fake_event(555, 2), "personal")
+
+    payload = json.loads(
+        await events.wait_for_settled_message(settle_ms=0, max_wait_ms=50, account="personal")
+    )
+
+    assert payload["account"] == "personal"
+    assert list(events._pending_msgs) == [("work", 555)]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_settled_message_ignores_traffic_on_other_accounts(two_accounts):
+    await events._on_new_incoming(_fake_event(555, 1), "work")
+
+    payload = json.loads(
+        await events.wait_for_settled_message(settle_ms=0, max_wait_ms=50, account="personal")
+    )
+
+    assert payload["event"] is False
+    assert payload["reason"] == "timeout"
+    assert list(events._pending_msgs) == [("work", 555)]
+
+
+@pytest.mark.asyncio
+async def test_chat_and_account_filters_compose(two_accounts):
+    """Same chat_id on both accounts: naming one account must pick exactly one."""
+    await events._on_new_incoming(_fake_event(555, 1), "work")
+    await events._on_new_incoming(_fake_event(555, 2), "personal")
+
+    payload = json.loads(
+        await events.wait_for_settled_message(
+            settle_ms=0, max_wait_ms=50, chat_id=555, account="personal"
+        )
+    )
+
+    assert payload["account"] == "personal"
+    assert payload["chat_id"] == 555
+    assert list(events._pending_msgs) == [("work", 555)]
+
+
+@pytest.mark.asyncio
+async def test_account_filter_is_case_insensitive(two_accounts):
+    await events._on_new_incoming(_fake_event(555, 1), "work")
+
+    payload = json.loads(await events.wait_for_new_message(timeout=0.05, account="WORK"))
+
+    assert payload["pending_chats"][0]["account"] == "work"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_call",
+    [
+        lambda: events.wait_for_new_message(timeout=0.05, account="nope"),
+        lambda: events.wait_for_settled_message(settle_ms=0, max_wait_ms=50, account="nope"),
+    ],
+)
+async def test_unknown_account_reports_the_configured_labels(two_accounts, tool_call):
+    result = await tool_call()
+
+    assert "nope" in result
+    assert "work" in result and "personal" in result
 
 
 def _register_fake_clients(monkeypatch):

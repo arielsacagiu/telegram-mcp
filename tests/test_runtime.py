@@ -1,5 +1,8 @@
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -716,6 +719,71 @@ def test_log_and_format_error_returns_custom_and_generated_messages(caplog):
     generated = runtime.log_and_format_error("get_chat", RuntimeError("boom"))
     assert "code: CHAT-ERR-" in generated
     assert "Check mcp_errors.log" in generated
+
+
+def test_resolve_api_id_parses_integer_value():
+    assert runtime._resolve_api_id(" 12345 ") == 12345
+
+
+def test_resolve_api_id_reads_environment_when_no_value_given(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_API_ID", "67890")
+    assert runtime._resolve_api_id() == 67890
+
+
+@pytest.mark.parametrize("raw_value", ["", "   "])
+def test_resolve_api_id_rejects_missing_value_with_actionable_message(raw_value):
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._resolve_api_id(raw_value)
+    message = str(excinfo.value)
+    assert "TELEGRAM_API_ID" in message
+    assert "my.telegram.org" in message
+
+
+def test_resolve_api_id_rejects_unset_environment_variable(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._resolve_api_id()
+    assert "TELEGRAM_API_ID" in str(excinfo.value)
+
+
+def test_resolve_api_id_rejects_non_integer_value():
+    with pytest.raises(SystemExit) as excinfo:
+        runtime._resolve_api_id("abc123")
+    message = str(excinfo.value)
+    assert "TELEGRAM_API_ID" in message
+    assert "abc123" in message
+
+
+def _error_code_from_subprocess(hash_seed: str) -> str:
+    """Return log_and_format_error's code for get_chat from a fresh interpreter."""
+    env = dict(os.environ)
+    env.update(
+        {
+            "PYTHONHASHSEED": hash_seed,
+            "TELEGRAM_API_ID": "12345",
+            "TELEGRAM_API_HASH": "dummy_hash",
+            "TELEGRAM_SESSION_NAME": "test_session",
+        }
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from telegram_mcp import runtime\n"
+            "print(runtime.log_and_format_error('get_chat', RuntimeError('boom')))",
+        ],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def test_error_code_is_stable_across_processes():
+    """Error codes must be greppable, so they cannot depend on PYTHONHASHSEED."""
+    assert _error_code_from_subprocess("0") == _error_code_from_subprocess("12345")
 
 
 def test_path_helper_edges(tmp_path, monkeypatch):
